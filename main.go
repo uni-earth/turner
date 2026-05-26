@@ -11,7 +11,6 @@ import (
 
 	"github.com/armon/go-socks5"
 	turner "github.com/staaldraad/turner/lib"
-	"gortc.io/stun"
 	"gortc.io/turn"
 	"gortc.io/turnc"
 )
