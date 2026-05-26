@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"strings"
+	"time"
 
 	"github.com/armon/go-socks5"
 	turner "github.com/staaldraad/turner/lib"
@@ -18,333 +17,176 @@ import (
 )
 
 var (
-	server = flag.String("server",
-		"localhost:3478",
-		"turn server address",
-	)
+	server    = flag.String("server", "localhost:3478", "TURN server address")
+	username  = flag.String("u", "user", "username")
+	password  = flag.String("p", "secret", "password")
+	socksPort = flag.Int("sp", 8000, "Port to use for SOCKS server")
+	socksHost = flag.String("sh", "127.0.0.1", "Host addr to listen on SOCKS5")
 
-	username     = flag.String("u", "user", "username")
-	password     = flag.String("p", "secret", "password")
-	socksProx    = flag.Bool("socks5", false, "Start a SOCKS5 server")
-	httpProx     = flag.Bool("http", false, "Start HTTP Proxy")
-	socksPort    = flag.Int("sp", 8000, "Port to use for SOCKS server")
-	httpPort     = flag.Int("hp", 8080, "Port to use for HTTP Proxy")
-	socksHost    = flag.String("sh", "127.0.0.1", "Host addr to listen on SOCKS5 (default 127.0.0.1)")
-	httpHost     = flag.String("hh", "127.0.0.1", "Host addr to listen on HTTP (default 127.0.0.1)")
-	translateIPv = flag.Bool("translate", false, "Transalte IP family in target, for example IPv6. Allows connecting to turn server with one version (IPv4) and be relayed to a peer with other (IPv6)")
+	allocPool = make(chan *PreWarmedAlloc, 10)
 )
 
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
+type PreWarmedAlloc struct {
+	ControlConn net.Conn
+	Client      *turnc.Client
+	Allocation  *turnc.Allocation
+}
+
+type WrappedConn struct {
+	*turner.StunConnection
+	ControlConn net.Conn
+}
+
+func (w *WrappedConn) Close() error {
+	w.ControlConn.Close()
+	return w.StunConnection.Close()
+}
+
+func startPoolMaintainer(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if len(allocPool) < cap(allocPool) {
+				alloc, err := createPreWarmedAlloc(ctx)
+				if err == nil {
+					allocPool <- alloc
+					time.Sleep(100 * time.Millisecond)
+				} else {
+					time.Sleep(1 * time.Second)
+				}
+			} else {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 	}
 }
 
-func bufHeader(src http.Header) []byte {
-	buf := make([]byte, 0)
-	for k, vv := range src {
-		buf = append(buf, []byte(k)...)
-		buf = append(buf, []byte(":")...)
-		for _, v := range vv {
-			buf = append(buf, []byte(v)...)
-		}
-		buf = append(buf, []byte("\r\n")...)
-	}
-	return buf
-}
-
-// this function is such an ugly hack but I'm tired and it works
-// look at replacing with real code that does io.Copy and
-// better buffer handling
-// this drains http headers, constructs manual method line
-// and manual host line
-// then sends everything to the server
-func handleHTTP(w http.ResponseWriter, r *http.Request) {
-
-	target := r.URL.Host
-	if target == "" {
-		w.Write([]byte("This is a HTTP Proxy, use it as such"))
-		return
-	}
-
-	port := r.URL.Port()
-
-	if port == "" {
-		port = "80"
-	}
-	peer := target
-	if strings.Index(target, ":") == -1 {
-		peer = fmt.Sprintf("%s:%s", target, port)
-	}
-	fmt.Printf("[*] Proxy to peer: %s\n", peer)
-
-	stunConnector, err := connectTurn(peer)
+func createPreWarmedAlloc(ctx context.Context) (*PreWarmedAlloc, error) {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
+	cRaw, err := dialer.DialContext(ctx, "tcp", *server)
 	if err != nil {
-		fmt.Printf("[x] error setting up STUN %s\n", err)
-		http.Error(w, "Proxy encountered error", http.StatusInternalServerError)
-		return
-	}
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
-		return
-	}
-	conn, bufwr, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	//ugly hack to recreate same function that could be achieved with httputil.DumpRequest
-	// create method line
-	methodLine := fmt.Sprintf("%s %s %s\r\n", r.Method, r.URL.Path, r.Proto)
-	hostLine := fmt.Sprintf("Host: %s\r\n", target)
-	stunConnector.Write([]byte(methodLine))
-	stunConnector.Write([]byte(hostLine))
-	stunConnector.Write(bufHeader(r.Header))
-	stunConnector.Write([]byte("\r\n"))
-	//drain body
-
-	io.Copy(stunConnector, r.Body)
-	io.Copy(bufwr, stunConnector)
-
-	// close the connections
-	defer conn.Close()
-	defer stunConnector.Close()
-}
-
-func handleProxyTun(w http.ResponseWriter, r *http.Request) {
-
-	target := r.URL.Host
-	if target == "" {
-		w.Write([]byte("This is a HTTP Proxy, use it as such"))
-		return
-	}
-
-	port := r.URL.Port()
-
-	if port == "" {
-		port = "80"
-	}
-	peer := r.Host
-
-	stunConnector, err := connectTurn(peer)
-	if err != nil {
-		fmt.Printf("[x] error setting up STUN %s\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		//clientConn.Write([]byte("Proxy encountered error"))
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-
-	go transfer(stunConnector, clientConn)
-	go transfer(clientConn, stunConnector)
-
-}
-
-func transfer(destination io.WriteCloser, source io.ReadCloser) {
-	defer destination.Close()
-	defer source.Close()
-	io.Copy(destination, source)
-}
-
-func connectTurn(target string) (*turner.StunConnection, error) {
-
-	stunConnector := &turner.StunConnection{}
-
-	// Resolving to TURN server.
-	raddr, err := net.ResolveTCPAddr("tcp", *server)
-	if err != nil {
-		fmt.Println(err)
 		return nil, err
 	}
-	c, err := net.DialTCP("tcp", nil, raddr)
+	c := cRaw.(*net.TCPConn)
+
+	var success bool
+	defer func() {
+		if !success {
+			c.Close()
+		}
+	}()
+
+	client, err := turnc.New(turnc.Options{Conn: c, Username: *username, Password: *password})
 	if err != nil {
-		fmt.Println(err)
 		return nil, err
 	}
-	fmt.Printf("[*] Dial server %s -> %s\n", c.LocalAddr(), c.RemoteAddr())
-	client, clientErr := turnc.New(turnc.Options{
-		Conn:     c,
-		Username: *username,
-		Password: *password,
-	})
-	if clientErr != nil {
-		fmt.Println(clientErr)
-		c.Close()
-		return nil, clientErr
-	}
-	var alloc *turnc.Allocation
-	var allocErr error
 
-	// do address family selection
-	// this allows:
-	// IPv4 <-> turn-server <-> IPv6
-	// IPv6 <-> turn-server <-> IPv4
-	// hide this behind a flag for now, normal behaviour is to
-	// use the same address family ex: IPv4 <-> turn-server <-> IPv4
-	if *translateIPv {
-		// strip port
-		t := target[:strings.LastIndex(target, ":")]
-		// silly check, IPv4 or hostname should be dotted decimal notation
-		if strings.Count(t, ":") == 0 {
-			alloc, allocErr = client.AllocateTCP4()
-		} else { // ipv6 will have :
-			alloc, allocErr = client.AllocateTCP6()
+	alloc, err := client.AllocateTCP()
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+
+	success = true
+	return &PreWarmedAlloc{ControlConn: c, Client: client, Allocation: alloc}, nil
+}
+
+func bindTargetWithAlloc(ctx context.Context, alloc *PreWarmedAlloc, target string) (*WrappedConn, error) {
+	var success bool
+	defer func() {
+		if !success {
+			alloc.Client.Close()
+			alloc.ControlConn.Close()
 		}
-	} else {
-		alloc, allocErr = client.AllocateTCP()
+	}()
+
+	peerAddr, err := net.ResolveTCPAddr("tcp", target)
+	if err != nil {
+		return nil, err
 	}
 
-	if allocErr != nil {
-		fmt.Println(allocErr)
-		client.Close()
-		return nil, allocErr
+	permission, err := alloc.Allocation.Create(peerAddr.IP)
+	if err != nil {
+		return nil, err
 	}
 
-	peerAddr, resolveErr := net.ResolveTCPAddr("tcp", target)
-	if resolveErr != nil {
-		client.Close()
-		return nil, resolveErr
-	}
-	fmt.Println("[*] Create peer permission")
-	permission, createErr := alloc.Create(peerAddr.IP)
-	if createErr != nil {
-		client.Close()
-		return nil, createErr
-	}
-	fmt.Println("[*] Create TCP Session Connection")
 	conn, err := permission.CreateTCP(peerAddr)
 	if err != nil {
-		client.Close()
 		return nil, err
 	}
 
-	fmt.Println("[*] Create connect request")
-	var connid stun.RawAttribute
-	if connid, err = conn.Connect(); err != nil {
-		client.Close()
-		return nil, err
-	}
-
-	// setup bind
-	fmt.Println("[*] Create bind TCP connection")
-	cb, err := net.DialTCP("tcp", nil, raddr)
+	connid, err := conn.Connect()
 	if err != nil {
-		client.Close()
 		return nil, err
 	}
 
-	fmt.Println("[*] Auth and Create client ")
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
+	cbRaw, err := dialer.DialContext(ctx, "tcp", *server)
+	if err != nil {
+		return nil, err
+	}
+	cb := cbRaw.(*net.TCPConn)
+
 	sideChanReader, sideChanWriter := io.Pipe()
 	r := io.MultiReader(sideChanReader, cb)
 
-	clientb, clientErr := turnc.NewData(turnc.Options{
-		Conn:     cb,
-		Username: *username,
-	}, *sideChanWriter)
-
-	if clientErr != nil {
-		client.Close()
-		return nil, clientErr
+	clientb, err := turnc.NewData(turnc.Options{Conn: cb, Username: *username}, *sideChanWriter)
+	if err != nil {
+		cb.Close()
+		return nil, err
 	}
 
 	connD, err := permission.CreateTCP(peerAddr)
 	if err != nil {
-		client.Close()
-		return nil, err
-	}
-
-	fmt.Println("[*] Bind client ")
-
-	_, err = clientb.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)), alloc, connD)
-	if err != nil {
-		client.Close()
 		clientb.Close()
+		cb.Close()
 		return nil, err
 	}
-	/*
-		buf := make([]byte, 10)
-		conn.Read(buf)
-		fmt.Println(buf)
-	*/
-	fmt.Println("[*] Bound")
 
-	stunConnector.CntrClient = *client
-	stunConnector.DataClient = *clientb
-	stunConnector.Conn = cb
-	stunConnector.MultiRead = r
+	_, err = clientb.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)), alloc.Allocation, connD)
+	if err != nil {
+		clientb.Close()
+		cb.Close()
+		return nil, err
+	}
 
-	return stunConnector, nil
+	success = true
+	return &WrappedConn{
+		StunConnection: &turner.StunConnection{
+			CntrClient: *alloc.Client, DataClient: *clientb, Conn: cb, MultiRead: r,
+		},
+		ControlConn: alloc.ControlConn,
+	}, nil
 }
 
 func turnDial(ctx context.Context, network, addr string) (net.Conn, error) {
-	cnn, err := connectTurn(addr)
-	if err != nil {
-		return nil, err
+	var alloc *PreWarmedAlloc
+	select {
+	case alloc = <-allocPool:
+	case <-time.After(1500 * time.Millisecond):
+		return nil, fmt.Errorf("timeout waiting for TURN allocation")
 	}
-	return cnn, nil
+	return bindTargetWithAlloc(ctx, alloc, addr)
 }
 
 func main() {
 	flag.Parse()
 
-	if !*httpProx && !*socksProx {
-		fmt.Println("[x] No mode selected. Use either, or both, -http or -socks5")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go startPoolMaintainer(ctx)
+
+	conf := &socks5.Config{
+		Dial: turnDial,
+		Logger: nil, 
+	}
+	
+	server, err := socks5.New(conf)
+	if err != nil {
 		return
 	}
-	errChan := make(chan error)
 
-	if *httpProx {
-		go func(errChan chan error) {
-			fmt.Printf("[*] Starting HTTP Server on %s:%d\n", *httpHost, *httpPort)
-			httpServer := &http.Server{
-				Addr: fmt.Sprintf("%s:%d", *httpHost, *httpPort),
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.Method == http.MethodConnect {
-						handleProxyTun(w, r)
-					} else {
-						handleHTTP(w, r)
-					}
-				}),
-				// Disable HTTP/2.
-				//TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
-			}
-			errChan <- httpServer.ListenAndServe()
-		}(errChan)
-	}
-
-	if *socksProx {
-		fmt.Printf("[*] Starting SOCKS5 Server on %s:%d\n", *socksHost, *socksPort)
-		go func(errChan chan error) {
-			conf := &socks5.Config{Dial: turnDial}
-			server, err := socks5.New(conf)
-			if err != nil {
-				errChan <- err
-				return
-			}
-
-			// Create SOCKS5 proxy on localhost port 8000
-			errChan <- server.ListenAndServe("tcp", fmt.Sprintf("%s:%d", *socksHost, *socksPort))
-		}(errChan)
-	}
-
-	select {
-	case <-errChan:
-		fmt.Println("Error setting up server.", errChan)
-	}
+	_ = server.ListenAndServe("tcp", fmt.Sprintf("%s:%d", *socksHost, *socksPort))
 }
