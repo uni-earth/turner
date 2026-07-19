@@ -4,22 +4,23 @@ go 1.20
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
-	gortc.io/stun v1.22.2
-	gortc.io/turn v0.11.2
-	gortc.io/turnc v0.2.0
+	
+	github.com/staaldraad/stun v1.22.3
+	github.com/staaldraad/turn v0.11.3
+	github.com/staaldraad/turnc v0.3.1
+	
+	golang.org/x/net v0.25.0	
+	go.uber.org/atomic v1.11.0
+	go.uber.org/multierr v1.11.0
+	go.uber.org/zap v1.28.0
 )
 
 require (
-	go.uber.org/atomic v1.4.0 // indirect
-	go.uber.org/multierr v1.1.0 // indirect
-	go.uber.org/zap v1.10.0 // indirect
-	golang.org/x/net v0.17.0 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/stretchr/objx v0.5.0 // indirect
+	github.com/stretchr/testify v1.8.4 // indirect
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace gortc.io/turn => github.com/staaldraad/turn v0.11.3
-
-replace gortc.io/turnc => github.com/staaldraad/turnc v0.3.1
-
-//replace gortc.io/turnc => ../turnc
-
-replace gortc.io/stun => github.com/staaldraad/stun v1.22.3
