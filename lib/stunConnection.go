@@ -1,7 +1,6 @@
 package turner
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -12,8 +11,9 @@ import (
 type StunConnection struct {
 	Conn       net.Conn
 	MultiRead  io.Reader
-	CntrClient turnc.Client
-	DataClient turnc.Client
+	// 【核心修改】：改为指针类型，确保 Close 时能杀掉底层的保活协程
+	CntrClient *turnc.Client
+	DataClient *turnc.Client
 }
 
 // Read data from peer.
@@ -25,13 +25,20 @@ func (c *StunConnection) Write(b []byte) (n int, err error) {
 	return c.Conn.Write(b)
 }
 
-// Close stops all refreshing loops for permission and removes it from
-// allocation.
+// Close stops all refreshing loops for permission and removes it from allocation.
 func (c *StunConnection) Close() error {
 	if c == nil {
 		return nil
 	}
-	fmt.Println("[*] Shut it all down")
+
+	// 【核心修改】：显式调用底层 TURN Client 的 Close 方法
+	// 发送释放指令给 TURN 服务器，并彻底清理本地的 Keep-Alive 协程防止断连卡死
+	if c.CntrClient != nil {
+		c.CntrClient.Close()
+	}
+	if c.DataClient != nil {
+		c.DataClient.Close()
+	}
 
 	return c.Conn.Close()
 }
@@ -51,7 +58,6 @@ func (c *StunConnection) SetDeadline(t time.Time) error {
 	return c.Conn.SetDeadline(t)
 }
 
-// SetReadD
 func (c *StunConnection) SetReadDeadline(t time.Time) error {
 	return c.Conn.SetReadDeadline(t)
 }
