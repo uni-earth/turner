@@ -26,8 +26,6 @@ jobs:
 
       - name: Build Binary
         run: |
-          # 【新增修复指令】：在编译前，自动下载所有依赖并生成正确的 go.sum 校验文件
-          go mod tidy
           # 针对不同系统做一点小兼容（Windows 加 .exe 后缀，macOS 内部叫 darwin）
           GOOS_TARGET=${{ matrix.goos }}
           [ "$GOOS_TARGET" = "osx" ] && GOOS_TARGET="darwin"
